@@ -1,23 +1,30 @@
-"""小红书搜索服务"""
+"""小红书搜索服务 - 基于 Spider_XHS 原生签名引擎
 
-import io
+彻底替换第三方 xhs 库，使用本地 JS 签名 + 直连 edith.xiaohongshu.com API，
+解决 300011 账号异常风控误杀问题。
+"""
+
 import json
-import httpx
 import re
+import math
+import random
 import logging
-import contextlib
+import requests
+import httpx
 from typing import List, Dict, Any
-from xhs import XhsClient
 from ..config import get_settings
 from .llm_service import get_llm
+from .xhs_sign.sign_util import generate_request_params, splice_str, generate_x_b3_traceid, trans_cookies
 
-# 静默 xhs 库的所有日志输出（它会通过 logging 打印原始 API 响应）
-logging.getLogger("xhs").setLevel(logging.CRITICAL)
-logging.getLogger("xhs.core").setLevel(logging.CRITICAL)
+logger = logging.getLogger(__name__)
+
 
 class XHSCookieExpiredError(Exception):
     """小红书 Cookie 过期致命异常，用于向前端报警"""
     pass
+
+
+# ============ Cookie 处理 ============
 
 def normalize_xhs_cookie(cookie: str) -> str:
     """兼容 Cookie 请求头字符串和浏览器导出的 JSON Cookie 列表。"""
@@ -55,22 +62,143 @@ def normalize_xhs_cookie(cookie: str) -> str:
 
     return normalized
 
-def get_xhs_client() -> XhsClient:
-    """初始化并验证小红书客户端"""
+
+# ============ 原生小红书 API 客户端 ============
+
+class XhsNativeClient:
+    """
+    使用 Spider_XHS 签名引擎直连小红书 API 的原生客户端。
+    不依赖任何第三方 xhs Python 库，通过 PyExecJS 调用本地 JS
+    生成 x-s / x-t / x-s-common 等完整签名，彻底绕过 300011 风控。
+    """
+    BASE_URL = "https://edith.xiaohongshu.com"
+
+    def __init__(self, cookies_str: str):
+        self.cookies_str = cookies_str
+
+    def search_notes(self, keyword: str, page: int = 1, sort_type: int = 0,
+                     page_size: int = 20) -> dict:
+        """
+        搜索笔记 - 直连 /api/sns/web/v1/search/notes
+        
+        Args:
+            keyword: 搜索关键词
+            page: 页码
+            sort_type: 排序方式 0综合 1最新 2最多点赞
+            page_size: 每页数量
+            
+        Returns:
+            API 响应 JSON
+        """
+        sort_map = {
+            0: "general",
+            1: "time_descending",
+            2: "popularity_descending",
+            3: "comment_descending",
+            4: "collect_descending",
+        }
+        sort = sort_map.get(sort_type, "general")
+
+        api = "/api/sns/web/v1/search/notes"
+        data = {
+            "keyword": keyword,
+            "page": page,
+            "page_size": page_size,
+            "search_id": generate_x_b3_traceid(21),
+            "sort": "general",
+            "note_type": 0,
+            "ext_flags": [],
+            "filters": [
+                {"tags": [sort], "type": "sort_type"},
+                {"tags": ["不限"], "type": "filter_note_type"},
+                {"tags": ["不限"], "type": "filter_note_time"},
+                {"tags": ["不限"], "type": "filter_note_range"},
+                {"tags": ["不限"], "type": "filter_pos_distance"},
+            ],
+            "geo": "",
+            "image_formats": ["jpg", "webp", "avif"],
+        }
+
+        headers, cookies, serialized_data = generate_request_params(
+            self.cookies_str, api, data, "POST"
+        )
+        response = requests.post(
+            self.BASE_URL + api,
+            headers=headers,
+            data=serialized_data.encode("utf-8"),
+            cookies=cookies,
+            timeout=15,
+        )
+        res_json = response.json()
+
+        if not res_json.get("success"):
+            code = res_json.get("code", "")
+            msg = res_json.get("msg", "")
+            if code == 300011 or "异常" in msg:
+                raise XHSCookieExpiredError(
+                    f"小红书 Cookie 已被风控拦截 (code={code}): {msg}。请更换 Cookie 后重试。"
+                )
+            raise Exception(f"小红书搜索失败 (code={code}): {msg}")
+
+        return res_json
+
+    def get_note_detail(self, note_id: str, xsec_token: str = "",
+                        xsec_source: str = "pc_search") -> dict:
+        """
+        获取笔记详情 - 直连 /api/sns/web/v1/feed
+        
+        Args:
+            note_id: 笔记 ID
+            xsec_token: 安全令牌（来自搜索结果）
+            xsec_source: 来源标识
+            
+        Returns:
+            笔记详情 JSON
+        """
+        api = "/api/sns/web/v1/feed"
+        data = {
+            "source_note_id": note_id,
+            "image_formats": ["jpg", "webp", "avif"],
+            "extra": {"need_body_topic": "1"},
+            "xsec_source": xsec_source,
+            "xsec_token": xsec_token,
+        }
+
+        headers, cookies, serialized_data = generate_request_params(
+            self.cookies_str, api, data, "POST"
+        )
+        response = requests.post(
+            self.BASE_URL + api,
+            headers=headers,
+            data=serialized_data,
+            cookies=cookies,
+            timeout=15,
+        )
+        res_json = response.json()
+
+        if not res_json.get("success"):
+            code = res_json.get("code", "")
+            msg = res_json.get("msg", "")
+            if code == 300011 or "异常" in msg:
+                raise XHSCookieExpiredError(
+                    f"小红书 Cookie 已被风控拦截 (code={code}): {msg}"
+                )
+
+        return res_json
+
+
+# ============ 客户端工厂 ============
+
+def get_xhs_client() -> XhsNativeClient:
+    """初始化并返回原生小红书客户端"""
     settings = get_settings()
     if not settings.xhs_cookie:
         raise XHSCookieExpiredError("小红书 Cookie 未配置，请在环境变量中设置 XHS_COOKIE")
-    try:
-        # 添加一个空白签名函数以避免 xhs 包在没有设置签名函数时抛出 NoneType object is not callable
-        def dummy_sign(uri, data=None, a1="", web_session=""):
-            return {"x-s": "", "x-t": ""}
+    cookie_str = normalize_xhs_cookie(settings.xhs_cookie)
+    return XhsNativeClient(cookie_str)
 
-        client = XhsClient(normalize_xhs_cookie(settings.xhs_cookie), sign=dummy_sign)
-        # 简单测试一下客户端有效性（调用不敏感的接口）
-        return client
-    except Exception as e:
-        print(f"小红书验证失败: {e}")
-        raise XHSCookieExpiredError(f"小红书 Cookie 已过期或被拦截，请重置: {str(e)}")
+
+# ============ 高德地理编码 ============
 
 def geocode_amap(address: str, city: str) -> dict:
     """内部静默使用高德Web服务进行地理编码补齐(为飞线服务)
@@ -78,8 +206,8 @@ def geocode_amap(address: str, city: str) -> dict:
     """
     settings = get_settings()
     if not settings.vite_amap_web_key:
-        return {"longitude": 116.397128, "latitude": 39.916527} # 默认兜底
-    
+        return {"longitude": 116.397128, "latitude": 39.916527}  # 默认兜底
+
     url = f"https://restapi.amap.com/v3/place/text?keywords={address}&city={city}&offset=1&key={settings.vite_amap_web_key}"
     try:
         resp = httpx.get(url, timeout=5)
@@ -90,12 +218,15 @@ def geocode_amap(address: str, city: str) -> dict:
             return {"longitude": float(lon), "latitude": float(lat)}
     except Exception as e:
         print(f"高德地理编码查阅失败 ({address}): {e}")
-    
+
     # 获取失败时给个默认兜底
     return {"longitude": 116.397128, "latitude": 39.916527}
 
+
+# ============ SSR 降级方案（备用） ============
+
 def get_note_detail_ssr(note_id: str) -> dict:
-    """通过网页抓取 SSR 状态提取笔记详情，规避风控"""
+    """通过网页抓取 SSR 状态提取笔记详情，作为原生 API 的降级备选"""
     url = f"https://www.xiaohongshu.com/explore/{note_id}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -110,6 +241,9 @@ def get_note_detail_ssr(note_id: str) -> dict:
         print(f"SSR详情提取失败 {note_id}: {e}")
     return {}
 
+
+# ============ 景点搜索核心函数 ============
+
 def search_xhs_attractions(city: str, keywords: str) -> str:
     """
     搜索小红书笔记，使用大模型极速提纯出结构化景点，
@@ -118,33 +252,49 @@ def search_xhs_attractions(city: str, keywords: str) -> str:
     print(f"🔍 [XHS_SERVICE] 正在呼叫小红书 API 搜索: {city} {keywords}")
     client = get_xhs_client()
     query = f"{city} {keywords} 旅游 景点攻略"
-    
+
     try:
-        # 静默调用，xhs 库内部会 print/logging 原始响应 dict，同时屏蔽 stdout 和 stderr
-        _devnull = io.StringIO()
-        with contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull):
-            res = client.get_note_by_keyword(keyword=query)
-        # 提取相关笔记，保守取前3~4篇核心高赞图文
-        notes = res.get('items', [])[:4]
-        
+        # 使用原生签名客户端搜索
+        res_json = client.search_notes(keyword=query)
+        items = res_json.get("data", {}).get("items", [])[:4]
+
         combined_text = ""
-        for i, note in enumerate(notes):
-            if note.get('model_type') == 'note':
-                note_card = note.get('note_card', {})
-                title = note_card.get('display_title', '')
+        for i, note in enumerate(items):
+            if note.get("model_type") == "note":
+                note_card = note.get("note_card", {})
+                title = note_card.get("display_title", "")
+
+                # 尝试通过原生 API 获取笔记详情
+                desc = ""
                 try:
-                    # 获取笔记详情，拿到长摘要（更方便大模型提取景点）规避风控
-                    detail = get_note_detail_ssr(note['id'])
-                    desc = detail.get('desc', '')
+                    note_id = note.get("id", "")
+                    xsec_token = note.get("xsec_token", "")
+                    if note_id:
+                        detail_res = client.get_note_detail(note_id, xsec_token)
+                        detail_items = detail_res.get("data", {}).get("items", [])
+                        if detail_items:
+                            note_data = detail_items[0].get("note_card", {})
+                            desc = note_data.get("desc", "")
                 except Exception:
-                    desc = ""
-                
+                    # 降级到 SSR 抓取
+                    try:
+                        note_id = note.get("id", "")
+                        if note_id:
+                            detail = get_note_detail_ssr(note_id)
+                            desc = detail.get("desc", "")
+                    except Exception:
+                        desc = ""
+
                 combined_text += f"\n笔记{i+1}:\n标题: {title}\n正文内容: {desc}\n"
+
+    except XHSCookieExpiredError:
+        raise
     except Exception as e:
         print(f"❌ 小红书接口抓取崩盘: {e}")
-        # 粗暴拦截所有可能的 Cookie 403 / 验证码风控报错
-        raise XHSCookieExpiredError(f"小红书访问超时或 Cookie 失效(风控拦截)，抓取失败。请更新 XHS_COOKIE")
-        
+        raise XHSCookieExpiredError(
+            f"小红书访问超时或 Cookie 失效(风控拦截)，抓取失败。请更新 XHS_COOKIE"
+        )
+
     if not combined_text:
         return f"未在小红书检索到关于 {city} {keywords} 的内容。"
 
@@ -175,16 +325,16 @@ JSON 返回示例:
         response = llm._client.chat.completions.create(
             model=llm.model,
             messages=[{"role": "user", "content": extract_prompt}],
-            temperature=0.1
+            temperature=0.1,
         )
         content = response.choices[0].message.content
-        
+
         json_match = re.search(r'\[.*\]', content, re.DOTALL)
         if json_match:
             extracted = json.loads(json_match.group())
         else:
             extracted = json.loads(content)
-            
+
         final_result = f"这是小红书热门精选游记的提取结果，附带确切坐标（图片由前端单独搜索获取）：\n"
         for item in extracted:
             name = item.get("name", "")
@@ -194,7 +344,7 @@ JSON 返回示例:
             loc = geocode_amap(name, city)
             item["location"] = loc
             final_result += json.dumps(item, ensure_ascii=False) + "\n"
-        
+
         print(f"✅ [XHS_SERVICE] 小红书数据挖掘完毕，已装载进上下文。")
         return final_result
 
@@ -203,58 +353,89 @@ JSON 返回示例:
         return "尝试提取小红书结构化数据失败，降级回常规处理。"
 
 
+# ============ 景点搜图 ============
+
 def get_xhs_photo_sync(keyword: str) -> str:
-    """根据关键词从小红书搜索一张首图URL，通过抓取SSR结构规避接口风控"""
-    # 构造一个带有 value 属性的假枚举，完美骗过 xhs 库底层的 `sort.value` 调用，同时无需强依赖它原本的类
-    class TimeDescSort:
-        value = "time_desc"
-        
+    """根据关键词从小红书搜索一张首图URL
+
+    使用原生签名客户端搜索最新帖子，然后通过原生 API 或 SSR 抓取首张图片。
+    """
     try:
         client = get_xhs_client()
+
         # 搜图时强制按"最新"排序，避开综合高赞的含文字攻略图
-        # 临时替换 builtins.print 来彻底屏蔽 xhs 库内部的 print 输出
-        import builtins
-        _original_print = builtins.print
-        builtins.print = lambda *a, **kw: None
-        try:
-            res = client.get_note_by_keyword(keyword=keyword, sort=TimeDescSort())
-        finally:
-            builtins.print = _original_print
-        notes = res.get('items', [])
-        
+        res_json = client.search_notes(keyword=keyword, sort_type=1)
+        items = res_json.get("data", {}).get("items", [])
+
         target_note_id = None
-        for note in notes:
-            if note.get('model_type') == 'note':
+        target_xsec_token = ""
+        for note in items:
+            if note.get("model_type") == "note":
                 target_note_id = note.get("id")
+                target_xsec_token = note.get("xsec_token", "")
                 break
-                
+
         if not target_note_id:
             return ""
 
-        # 直接请求网页 HTML
+        # 方案 A: 通过原生 API 获取笔记详情和图片
+        try:
+            detail_res = client.get_note_detail(
+                target_note_id, target_xsec_token
+            )
+            detail_items = detail_res.get("data", {}).get("items", [])
+            if detail_items:
+                note_card = detail_items[0].get("note_card", {})
+                image_list = note_card.get("image_list", [])
+                if image_list:
+                    # 取第一张图的 URL
+                    first_img = image_list[0]
+                    # 优先 info_list 中的高清图
+                    info_list = first_img.get("info_list", [])
+                    if len(info_list) > 1:
+                        return info_list[1].get("url", "")
+                    elif info_list:
+                        return info_list[0].get("url", "")
+                    # 降级到其他字段
+                    return (
+                        first_img.get("url_default", "")
+                        or first_img.get("url_pre", "")
+                        or first_img.get("url", "")
+                    )
+        except Exception:
+            pass
+
+        # 方案 B: 降级到 SSR 抓取
         url = f"https://www.xiaohongshu.com/explore/{target_note_id}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
         resp = httpx.get(url, headers=headers, timeout=10)
-        
-        # 解析 INITIAL_STATE
+
         match = re.search(r'window\.__INITIAL_STATE__=({.*?})</script>', resp.text)
         if match:
-            # 兼容 js 中的 undefined
-            state_json_str = match.group(1).replace('undefined', 'null')
+            state_json_str = match.group(1).replace("undefined", "null")
             state_json = json.loads(state_json_str)
-            note_data = state_json.get("note", {}).get("noteDetailMap", {}).get(target_note_id, {}).get("note", {})
+            note_data = (
+                state_json.get("note", {})
+                .get("noteDetailMap", {})
+                .get(target_note_id, {})
+                .get("note", {})
+            )
             img_list = note_data.get("imageList", [])
             if img_list:
-                # 寻找第一个高清直链
-                first_img = img_list[0].get("urlDefault") or img_list[0].get("urlPattern") or img_list[0].get("url")
+                first_img = (
+                    img_list[0].get("urlDefault")
+                    or img_list[0].get("urlPattern")
+                    or img_list[0].get("url")
+                )
                 if first_img:
                     return first_img
-                    
+
     except Exception as e:
         print(f"小红书单图抓取失败 ({keyword}): {e}")
     return ""
+
 
 async def get_photo_from_xhs(keyword: str) -> str:
     """供异步环境调用的小红书图片搜索API"""

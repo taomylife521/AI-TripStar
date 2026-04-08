@@ -2,7 +2,7 @@
 
 import os
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -20,6 +20,19 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc"
 )
+
+@app.middleware("http")
+async def intercept_proxy_path(request: Request, call_next):
+    """
+    解决云部署环境或前端代理会在路径前拼接一段动态 ID 的问题。
+    例如自动将 /5985f5334705698/api/trip/plan 重写为后端的真实路径 /api/trip/plan
+    """
+    path = request.scope.get("path", "")
+    if "/api/" in path and not path.startswith("/api/"):
+        api_index = path.find("/api/")
+        request.scope["path"] = path[api_index:]
+        
+    return await call_next(request)
 
 # 配置CORS
 app.add_middleware(

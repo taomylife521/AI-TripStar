@@ -145,6 +145,13 @@ PLANNER_AGENT_PROMPT = """你是行程规划专家。你的任务是根据景点
 }
 ```
 
+**⚠️ JSON 格式关键约束（违反将导致系统崩溃）：**
+- budget 中所有费用字段（total_attractions、total_hotels、total_meals、total_transportation、total）必须是**纯数字**，绝对禁止出现算术表达式！
+  - ✅ 正确: "total_attractions": 324
+  - ❌ 错误: "total_attractions": 30+54+120+120=324
+  - ❌ 错误: "total_attractions": "324元"
+- ticket_price、estimated_cost 等所有价格字段也必须是纯数字，不带单位
+
 **重要提示:**
 1. weather_info数组必须包含每一天的天气信息
 2. 温度必须是纯数字(不要带°C等单位)
@@ -364,6 +371,28 @@ class MultiAgentTripPlanner:
         json_str = json_str.replace('\u2018', "'").replace('\u2019', "'")
         json_str = json_str.replace('\uff1a', ':')
         json_str = json_str.replace('\uff0c', ',')
+        # 6. 修复 LLM 在 budget 等数值字段中输出算术表达式的问题
+        #    例如: "total_attractions": 30+54+120+120=324 → "total_attractions": 324
+        #    模式: 冒号后面跟着 数字[+-*/]数字...=最终结果
+        def _fix_arithmetic_expr(m):
+            """将算术表达式替换为等号后的最终结果，若无等号则尝试 eval"""
+            expr = m.group(1).strip()
+            if '=' in expr:
+                # 取等号后面的最终结果
+                return m.group(0).replace(m.group(1), expr.split('=')[-1].strip())
+            else:
+                # 没有等号，尝试安全计算
+                try:
+                    result = eval(expr, {"__builtins__": {}}, {})
+                    return m.group(0).replace(m.group(1), str(result))
+                except Exception:
+                    return m.group(0)
+        # 匹配 JSON 键值对中冒号后的算术表达式（含 +、-、*、= 且以数字开头）
+        json_str = _re.sub(
+            r':\s*(\d+(?:\s*[+\-*/]\s*\d+)+(?:\s*=\s*\d+)?)',
+            _fix_arithmetic_expr,
+            json_str
+        )
         return json_str
     
     def _fix_unescaped_quotes(self, json_str: str) -> str:
