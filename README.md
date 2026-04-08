@@ -156,6 +156,9 @@ Docker 部署采用容器环境变量作为后端运行时配置来源：
 # 进入后端主目录
 cd backend
 
+# 安装小红书签名引擎的 Node.js 依赖
+npm install
+
 # 创建虚拟环境
 python -m venv .venv
 
