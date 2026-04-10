@@ -156,6 +156,7 @@ import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import axios from 'axios'
 import type { ChatMessage, TripPlan } from '@/types'
+import { getRuntimeApiBaseUrl } from '@/services/api'
 
 const props = defineProps<{
   tripPlan: TripPlan | null
@@ -225,7 +226,7 @@ const sendChatMessage = async () => {
   scrollChatToBottom()
 
   try {
-    const apiBase = import.meta.env.VITE_API_BASE_URL ?? ''
+    const apiBase = getRuntimeApiBaseUrl()
     const res = await axios.post(`${apiBase}/api/chat/ask`, {
       message: text,
       trip_plan: props.tripPlan,

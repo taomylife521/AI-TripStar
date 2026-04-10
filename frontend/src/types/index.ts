@@ -119,6 +119,25 @@ export interface TripTaskEvent {
   result?: TripPlanResponse
 }
 
+export interface BackendRuntimeSettings {
+  vite_amap_web_key: string
+  vite_amap_web_js_key: string
+  xhs_cookie: string
+  openai_api_key: string
+  openai_base_url: string
+  openai_model: string
+}
+
+export interface RuntimeSettings {
+  api_base_url: string
+  vite_amap_web_key: string
+  vite_amap_web_js_key: string
+  xhs_cookie: string
+  openai_api_key: string
+  openai_base_url: string
+  openai_model: string
+}
+
 // ============ 知识图谱类型 ============
 
 export interface GraphNode {

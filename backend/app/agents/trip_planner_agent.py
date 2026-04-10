@@ -598,3 +598,9 @@ def get_trip_planner_agent() -> MultiAgentTripPlanner:
 
     return _multi_agent_planner
 
+
+def reset_trip_planner_agent() -> None:
+    """重置旅行规划多智能体实例（用于运行时配置更新后热生效）。"""
+    global _multi_agent_planner
+    _multi_agent_planner = None
+

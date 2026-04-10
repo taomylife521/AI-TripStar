@@ -582,6 +582,11 @@ import NavBar from '@/components/NavBar.vue'
 import OverviewAttractionCard from '@/components/OverviewAttractionCard.vue'
 import AIChat from '@/components/AIChat.vue'
 import type { TripPlan, KnowledgeGraphData, GraphCategory, Attraction, Meal, Hotel, WeatherInfo } from '@/types'
+import {
+  getRuntimeApiBaseUrl,
+  getRuntimeMapJsKey,
+  RUNTIME_SETTINGS_UPDATED_EVENT,
+} from '@/services/api'
 
 const router = useRouter()
 const route = useRoute()
@@ -902,6 +907,18 @@ const ensureMapReady = async () => {
   }
 }
 
+const handleRuntimeSettingsUpdated = () => {
+  if (map) {
+    map.destroy()
+    map = null
+  }
+  if (activeSection.value === 'map') {
+    void nextTick(async () => {
+      await ensureMapReady()
+    })
+  }
+}
+
 const ensureGraphReady = async () => {
   if (!graphData.value) return
   await nextTick()
@@ -1140,6 +1157,9 @@ const buildKgBoundaryPositionMap = (
 }
 
 onMounted(async () => {
+  if (typeof window !== 'undefined') {
+    window.addEventListener(RUNTIME_SETTINGS_UPDATED_EVENT, handleRuntimeSettingsUpdated)
+  }
   planId.value = String(route.query.plan_id || sessionStorage.getItem('planId') || '')
   if (planId.value) {
     sessionStorage.setItem('planId', planId.value)
@@ -1188,7 +1208,14 @@ watch(
 )
 
 onUnmounted(() => {
+  if (typeof window !== 'undefined') {
+    window.removeEventListener(RUNTIME_SETTINGS_UPDATED_EVENT, handleRuntimeSettingsUpdated)
+  }
   destroyOverviewSwiper()
+  if (map) {
+    map.destroy()
+    map = null
+  }
   if (kgResizeHandler) {
     window.removeEventListener('resize', kgResizeHandler)
     kgResizeHandler = null
@@ -1685,7 +1712,7 @@ const restoreBudgetItem = (pendingItem: BudgetRestoreItem) => {
 const loadAttractionPhotos = async () => {
   if (!tripPlan.value) return
 
-  const apiBase = import.meta.env.VITE_API_BASE_URL ?? ''
+  const apiBase = getRuntimeApiBaseUrl()
   const city = tripPlan.value.city
   const uniqueNames = Array.from(
     new Set(
@@ -2387,8 +2414,13 @@ const searchRoutePath = (
 // 初始化地图
 const initMap = async () => {
   try {
+    const mapJsKey = getRuntimeMapJsKey()
+    if (!mapJsKey) {
+      message.warning('请先在设置中配置高德地图 JS Key')
+      return
+    }
     const AMap = await AMapLoader.load({
-      key: import.meta.env.VITE_AMAP_WEB_JS_KEY,  // 高德地图Web端(JS API) Key
+      key: mapJsKey,  // 高德地图Web端(JS API) Key
       version: '2.0',
       plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow', 'AMap.Driving', 'AMap.Walking']
     })

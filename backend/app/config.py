@@ -1,8 +1,9 @@
 """配置管理模块"""
 
 import os
+import json
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Any
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
@@ -33,6 +34,7 @@ class Settings(BaseSettings):
 
     # 高德地图API配置
     vite_amap_web_key: str = ""
+    vite_amap_web_js_key: str = ""
 
     # 小红书配置
     xhs_cookie: str = ""
@@ -57,6 +59,61 @@ class Settings(BaseSettings):
 
 # 创建全局配置实例
 settings = Settings()
+_RUNTIME_SETTINGS_FILE = Path(__file__).resolve().parent.parent / "runtime_settings.json"
+_RUNTIME_SETTING_KEYS = {
+    "vite_amap_web_key",
+    "vite_amap_web_js_key",
+    "xhs_cookie",
+    "openai_api_key",
+    "openai_base_url",
+    "openai_model",
+}
+
+
+def _load_runtime_overrides() -> Dict[str, Any]:
+    """加载本地持久化的运行时配置覆盖项。"""
+    if not _RUNTIME_SETTINGS_FILE.exists():
+        return {}
+    try:
+        with open(_RUNTIME_SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: data[k] for k in _RUNTIME_SETTING_KEYS if k in data}
+    except Exception as e:
+        print(f"⚠️  读取运行时配置失败，已回退到环境变量: {e}")
+    return {}
+
+
+def _persist_runtime_overrides(overrides: Dict[str, Any]) -> None:
+    """持久化运行时配置覆盖项。"""
+    _RUNTIME_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(_RUNTIME_SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(overrides, f, ensure_ascii=False, indent=2)
+
+
+def _sync_env_from_settings() -> None:
+    """将运行时配置同步到环境变量，兼容读取 env 的第三方组件。"""
+    if settings.openai_api_key:
+        os.environ["OPENAI_API_KEY"] = settings.openai_api_key
+        os.environ["LLM_API_KEY"] = settings.openai_api_key
+    if settings.openai_base_url:
+        os.environ["OPENAI_BASE_URL"] = settings.openai_base_url
+        os.environ["LLM_BASE_URL"] = settings.openai_base_url
+    if settings.openai_model:
+        os.environ["OPENAI_MODEL"] = settings.openai_model
+        os.environ["LLM_MODEL_ID"] = settings.openai_model
+
+
+def _apply_runtime_overrides(overrides: Dict[str, Any]) -> None:
+    """将覆盖项应用到全局 settings 实例。"""
+    for key, value in overrides.items():
+        if key in _RUNTIME_SETTING_KEYS and hasattr(settings, key):
+            setattr(settings, key, value if value is not None else "")
+    _sync_env_from_settings()
+
+
+_runtime_overrides = _load_runtime_overrides()
+_apply_runtime_overrides(_runtime_overrides)
 
 
 def get_settings() -> Settings:
@@ -64,23 +121,45 @@ def get_settings() -> Settings:
     return settings
 
 
+def get_runtime_settings() -> Dict[str, str]:
+    """获取当前运行时配置（供前端设置页读取）。"""
+    return {
+        "vite_amap_web_key": settings.vite_amap_web_key or "",
+        "vite_amap_web_js_key": settings.vite_amap_web_js_key or "",
+        "xhs_cookie": settings.xhs_cookie or "",
+        "openai_api_key": settings.openai_api_key or "",
+        "openai_base_url": settings.openai_base_url or "",
+        "openai_model": settings.openai_model or "",
+    }
+
+
+def update_runtime_settings(updates: Dict[str, Any]) -> Dict[str, str]:
+    """更新并持久化运行时配置。"""
+    global _runtime_overrides
+
+    normalized: Dict[str, str] = {}
+    for key, value in updates.items():
+        if key not in _RUNTIME_SETTING_KEYS:
+            continue
+        normalized[key] = str(value).strip() if value is not None else ""
+
+    _runtime_overrides.update(normalized)
+    _persist_runtime_overrides(_runtime_overrides)
+    _apply_runtime_overrides(_runtime_overrides)
+    return get_runtime_settings()
+
+
 # 验证必要的配置
 def validate_config():
     """验证配置是否完整"""
-    errors = []
     warnings = []
 
     if not settings.vite_amap_web_key:
-        errors.append("VITE_AMAP_WEB_KEY未配置")
+        warnings.append("VITE_AMAP_WEB_KEY未配置，景点地理编码等功能将不可用")
 
-    # HelloAgentsLLM会自动从LLM_API_KEY读取,不强制要求OPENAI_API_KEY
-    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    llm_api_key = settings.openai_api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not llm_api_key:
-        warnings.append("LLM_API_KEY或OPENAI_API_KEY未配置,LLM功能可能无法使用")
-
-    if errors:
-        error_msg = "配置错误:\n" + "\n".join(f"  - {e}" for e in errors)
-        raise ValueError(error_msg)
+        warnings.append("LLM API Key未配置，AI 生成功能将不可用")
 
     if warnings:
         print("\n⚠️  配置警告:")
@@ -97,12 +176,13 @@ def print_config():
     print(f"版本: {settings.app_version}")
     print(f"服务器: {settings.host}:{settings.port}")
     print(f"高德地图API Key: {'已配置' if settings.vite_amap_web_key else '未配置'}")
+    print(f"高德地图JS Key: {'已配置' if settings.vite_amap_web_js_key else '未配置'}")
     print(f"小红书Cookie: {'已配置' if settings.xhs_cookie else '未配置'}")
 
     # 检查LLM配置
-    llm_api_key = os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
-    llm_base_url = os.getenv("LLM_BASE_URL") or settings.openai_base_url
-    llm_model = os.getenv("LLM_MODEL_ID") or settings.openai_model
+    llm_api_key = settings.openai_api_key or os.getenv("LLM_API_KEY") or os.getenv("OPENAI_API_KEY")
+    llm_base_url = settings.openai_base_url
+    llm_model = settings.openai_model
 
     print(f"LLM API Key: {'已配置' if llm_api_key else '未配置'}")
     print(f"LLM Base URL: {llm_base_url}")

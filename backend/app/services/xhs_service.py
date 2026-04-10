@@ -193,7 +193,7 @@ def get_xhs_client() -> XhsNativeClient:
     """初始化并返回原生小红书客户端"""
     settings = get_settings()
     if not settings.xhs_cookie:
-        raise XHSCookieExpiredError("小红书 Cookie 未配置，请在环境变量中设置 XHS_COOKIE")
+        raise XHSCookieExpiredError("小红书 Cookie 未配置，请先在前端设置页完成配置")
     cookie_str = normalize_xhs_cookie(settings.xhs_cookie)
     return XhsNativeClient(cookie_str)
 

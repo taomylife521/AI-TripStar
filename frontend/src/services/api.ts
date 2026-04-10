@@ -1,10 +1,38 @@
 import axios from 'axios'
-import type { TripFormData, TripPlanResponse, TripTaskEvent } from '@/types'
+import type {
+  BackendRuntimeSettings,
+  RuntimeSettings,
+  TripFormData,
+  TripPlanResponse,
+  TripTaskEvent,
+} from '@/types'
 import { i18n } from '@/i18n'
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+const ENV_API_BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+const ENV_AMAP_WEB_JS_KEY = import.meta.env.VITE_AMAP_WEB_JS_KEY ?? ''
+const RUNTIME_API_BASE_STORAGE_KEY = 'tripstar.runtime.api_base_url'
+const RUNTIME_AMAP_WEB_JS_KEY_STORAGE_KEY = 'tripstar.runtime.amap_web_js_key'
+const DEFAULT_RUNTIME_BACKEND_SETTINGS: BackendRuntimeSettings = {
+  vite_amap_web_key: '',
+  vite_amap_web_js_key: '',
+  xhs_cookie: '',
+  openai_api_key: '',
+  openai_base_url: 'https://api.openai.com/v1',
+  openai_model: 'gpt-4',
+}
+
+export const RUNTIME_SETTINGS_UPDATED_EVENT = 'tripstar:runtime-settings-updated'
 const t = i18n.global.t
-const WS_BASE_URL = API_BASE_URL.replace(/^http/i, 'ws').replace(/\/+$/, '')
+
+const normalizeBaseUrl = (value: string | null | undefined): string => {
+  const text = String(value ?? '').trim()
+  return text.replace(/\/+$/, '')
+}
+
+const normalizeText = (value: unknown): string => String(value ?? '').trim()
+
+const DEFAULT_API_BASE_URL = normalizeBaseUrl(ENV_API_BASE_URL) || 'http://localhost:8000'
+const DEFAULT_AMAP_WEB_JS_KEY = normalizeText(ENV_AMAP_WEB_JS_KEY)
 
 interface SubmitTripPlanResponse {
   task_id: string
@@ -19,8 +47,69 @@ interface GenerateTripPlanOptions {
   onTaskEvent?: (event: TripTaskEvent) => void
 }
 
+interface RuntimeSettingsApiResponse {
+  success: boolean
+  message?: string
+  data?: Partial<BackendRuntimeSettings>
+}
+
+export const getRuntimeApiBaseUrl = (): string => {
+  if (typeof window === 'undefined') {
+    return DEFAULT_API_BASE_URL
+  }
+  const saved = normalizeBaseUrl(window.localStorage.getItem(RUNTIME_API_BASE_STORAGE_KEY))
+  return saved || DEFAULT_API_BASE_URL
+}
+
+export const setRuntimeApiBaseUrl = (value: string): string => {
+  const normalized = normalizeBaseUrl(value) || DEFAULT_API_BASE_URL
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(RUNTIME_API_BASE_STORAGE_KEY, normalized)
+  }
+  return normalized
+}
+
+export const getRuntimeMapJsKey = (): string => {
+  if (typeof window === 'undefined') {
+    return DEFAULT_AMAP_WEB_JS_KEY
+  }
+  const saved = normalizeText(window.localStorage.getItem(RUNTIME_AMAP_WEB_JS_KEY_STORAGE_KEY))
+  return saved || DEFAULT_AMAP_WEB_JS_KEY
+}
+
+export const setRuntimeMapJsKey = (value: string): string => {
+  const normalized = normalizeText(value)
+  if (typeof window !== 'undefined') {
+    window.localStorage.setItem(RUNTIME_AMAP_WEB_JS_KEY_STORAGE_KEY, normalized)
+  }
+  return normalized
+}
+
+const getWsBaseUrl = (): string => getRuntimeApiBaseUrl().replace(/^http/i, 'ws').replace(/\/+$/, '')
+
+const normalizeBackendRuntimeSettings = (
+  data?: Partial<BackendRuntimeSettings>
+): BackendRuntimeSettings => ({
+  vite_amap_web_key: normalizeText(data?.vite_amap_web_key ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.vite_amap_web_key),
+  vite_amap_web_js_key: normalizeText(
+    data?.vite_amap_web_js_key ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.vite_amap_web_js_key
+  ),
+  xhs_cookie: normalizeText(data?.xhs_cookie ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.xhs_cookie),
+  openai_api_key: normalizeText(data?.openai_api_key ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.openai_api_key),
+  openai_base_url:
+    normalizeText(data?.openai_base_url ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.openai_base_url) ||
+    DEFAULT_RUNTIME_BACKEND_SETTINGS.openai_base_url,
+  openai_model:
+    normalizeText(data?.openai_model ?? DEFAULT_RUNTIME_BACKEND_SETTINGS.openai_model) ||
+    DEFAULT_RUNTIME_BACKEND_SETTINGS.openai_model,
+})
+
+const emitRuntimeSettingsUpdated = () => {
+  if (typeof window === 'undefined') return
+  window.dispatchEvent(new CustomEvent(RUNTIME_SETTINGS_UPDATED_EVENT))
+}
+
 const apiClient = axios.create({
-  baseURL: API_BASE_URL,
   timeout: 0, // 无超时限制，等待后端返回结果
   headers: {
     'Content-Type': 'application/json'
@@ -30,6 +119,7 @@ const apiClient = axios.create({
 // 请求拦截器
 apiClient.interceptors.request.use(
   (config) => {
+    config.baseURL = getRuntimeApiBaseUrl()
     console.log('发送请求:', config.method?.toUpperCase(), config.url)
     return config
   },
@@ -50,6 +140,73 @@ apiClient.interceptors.response.use(
     return Promise.reject(error)
   }
 )
+
+export async function getBackendRuntimeSettings(): Promise<BackendRuntimeSettings> {
+  try {
+    const response = await apiClient.get<RuntimeSettingsApiResponse>('/api/settings')
+    return normalizeBackendRuntimeSettings(response.data?.data)
+  } catch (error: any) {
+    console.error('读取运行时配置失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || '读取配置失败')
+  }
+}
+
+export async function updateBackendRuntimeSettings(
+  updates: Partial<BackendRuntimeSettings>
+): Promise<BackendRuntimeSettings> {
+  try {
+    const response = await apiClient.put<RuntimeSettingsApiResponse>('/api/settings', updates)
+    return normalizeBackendRuntimeSettings(response.data?.data)
+  } catch (error: any) {
+    console.error('保存运行时配置失败:', error)
+    throw new Error(error.response?.data?.detail || error.message || '保存配置失败')
+  }
+}
+
+export async function getRuntimeSettings(): Promise<RuntimeSettings> {
+  const backend = await getBackendRuntimeSettings()
+  const apiBaseUrl = getRuntimeApiBaseUrl()
+  const mapJsKey = getRuntimeMapJsKey() || backend.vite_amap_web_js_key
+
+  return {
+    api_base_url: apiBaseUrl,
+    ...backend,
+    vite_amap_web_js_key: mapJsKey,
+  }
+}
+
+export async function saveRuntimeSettings(settings: RuntimeSettings): Promise<RuntimeSettings> {
+  const previousApiBaseUrl = getRuntimeApiBaseUrl()
+  const targetApiBaseUrl = normalizeBaseUrl(settings.api_base_url) || previousApiBaseUrl
+  const updates: Partial<BackendRuntimeSettings> = {
+    vite_amap_web_key: settings.vite_amap_web_key,
+    vite_amap_web_js_key: settings.vite_amap_web_js_key,
+    xhs_cookie: settings.xhs_cookie,
+    openai_api_key: settings.openai_api_key,
+    openai_base_url: settings.openai_base_url,
+    openai_model: settings.openai_model,
+  }
+  setRuntimeApiBaseUrl(targetApiBaseUrl)
+
+  let backend: BackendRuntimeSettings
+  try {
+    backend = await updateBackendRuntimeSettings(updates)
+  } catch (error) {
+    setRuntimeApiBaseUrl(previousApiBaseUrl)
+    throw error
+  }
+
+  const apiBaseUrl = setRuntimeApiBaseUrl(targetApiBaseUrl)
+  const mapJsKey = setRuntimeMapJsKey(settings.vite_amap_web_js_key || backend.vite_amap_web_js_key)
+
+  emitRuntimeSettingsUpdated()
+
+  return {
+    api_base_url: apiBaseUrl,
+    ...backend,
+    vite_amap_web_js_key: mapJsKey || backend.vite_amap_web_js_key,
+  }
+}
 
 /**
  * 提交旅行规划任务（立即返回 task_id）
@@ -87,7 +244,9 @@ export async function generateTripPlan(
   const task = await submitTripPlan(formData)
   options?.onTaskCreated?.(task)
 
-  const wsUrl = `${WS_BASE_URL}${task.ws_url}`
+  const wsUrl = task.ws_url.startsWith('ws://') || task.ws_url.startsWith('wss://')
+    ? task.ws_url
+    : `${getWsBaseUrl()}${task.ws_url}`
 
   return new Promise((resolve, reject) => {
     let settled = false
